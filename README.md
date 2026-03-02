@@ -47,7 +47,7 @@
 ### 一键运行命令
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Henry00123/tcp-tune/main/tcp-tune.sh -o tcp-tune.sh && chmod +x tcp-tune.sh && sudo ./tcp-tune.sh
-
+...
 模块化极客终端 UI
 脚本拒绝“跑完就没”的黑盒操作，自带常驻的 ANSI 色彩状态控制台。配置了什么、当前生效了什么，一目了然。
 
@@ -79,6 +79,5 @@ Ini, TOML
 net.core.rmem_max = 33554432
 # 发送最大值 (针对 50M 上行)
 net.core.wmem_max = 4194304
-...
 📜 免责声明
 本脚本涉及大量操作系统底层协议栈、句柄数量以及内存调度机制的修改。虽然内置了严格的物理算力兜底防线（防止小内存机器 OOM），但在生产环境（尤其是承载高价值数据库的服务器）部署前，请务必在测试环境验证。对于因过度调优导致的任何业务中断或数据异常，本项目不提供担保责任。
