@@ -46,7 +46,7 @@
 
 ### 一键运行命令
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Henry00123/tcp-tune/main/tcp-tune.sh -o tcp-tune.sh && chmod +x tcp-tune.sh && sudo ./tcp-tune.sh
+curl -fsSL https://raw.githubusercontent.com/Henry00123/tcp-tune/main/net-tune.sh -o net-tune.sh && chmod +x net-tune.sh && sudo ./net-tune.sh
 ```
 
 ## 模块化极客终端 UI
