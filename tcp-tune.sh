@@ -59,9 +59,9 @@ show_status() {
     fi
 
     if systemctl is-active --quiet vps-net-fix.service; then
-        echo -e "  ${BOLD}持久化服务${NC}          : ${GREEN}● 运行中 (重启自动恢复)${NC}"
+        echo -e "  ${BOLD}持久化服务${NC}           : ${GREEN}● 运行中 (重启自动恢复)${NC}"
     else
-        echo -e "  ${BOLD}持久化服务${NC}          : ${RED}○ 未激活${NC}"
+        echo -e "  ${BOLD}持久化服务${NC}           : ${RED}○ 未激活${NC}"
     fi
 
     draw_line
@@ -208,4 +208,4 @@ systemctl restart vps-net-fix.service
 
 [[ "$ENABLE_TC" =~ ^[Yy]$ ]] && tc qdisc replace dev $MAIN_IFACE root fq maxrate ${TC_RATE}mbit 2>/dev/null
 
-echo -e "\n${BOLD}${GREEN}✔ 配置已成功应用！界面显示已修复。🚀${NC}\n"
+echo -e "\n${BOLD}${GREEN}✔ 配置已成功应用！🚀${NC}\n"
