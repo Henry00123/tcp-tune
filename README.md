@@ -46,4 +46,4 @@
 
 ### 一键运行命令
 ```bash
-wget -O vps_tune.sh [https://raw.githubusercontent.com/Henry00123/tcp-tune/main/tcp_tune.sh](https://raw.githubusercontent.com/Henry00123/tcp-tune/main/tcp_tune.sh) && chmod +x vps_tune.sh && ./vps_tune.sh
+curl -fsSL https://raw.githubusercontent.com/Henry00123/tcp-tune/main/tcp-tune.sh -o tcp-tune.sh && chmod +x tcp-tune.sh && sudo ./tcp-tune.sh
