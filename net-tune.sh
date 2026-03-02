@@ -45,7 +45,7 @@ calc_buffer() {
 }
 
 # ====================================================
-# 模块 1: 底层网络核心调优 (v5.0 终极全栈版)
+# 模块 1: 底层网络核心调优 (v5.1 加入 UDP 专项)
 # ====================================================
 setup_network() {
     clear
@@ -74,22 +74,26 @@ setup_network() {
     CONN_MAX=$(( RAM_MB * 100 )); [ "$CONN_MAX" -lt 65536 ] && CONN_MAX=65536
     Q_SIZE=$(( CORES * 8192 )); [ "$Q_SIZE" -gt 65535 ] && Q_SIZE=65535
     
-    # 动态计算文件描述符上限
-    FD_MAX=$(( RAM_MB * 256 ))
-    [ "$FD_MAX" -lt 1048576 ] && FD_MAX=1048576 # 最低保障 100 万
+    # TCP与UDP的共享内存红线 (25%物理内存)
+    PAGES_PER_MB=256
+    MEM_MAX=$(( RAM_MB * PAGES_PER_MB * 25 / 100 ))
+    MEM_MID=$(( MEM_MAX * 3 / 4 ))
+    MEM_MIN=$(( MEM_MAX / 2 ))
 
-    # 1. 写入内核配置 (加入 fs.file-max, vm.swappiness, keepalive)
+    FD_MAX=$(( RAM_MB * 256 ))
+    [ "$FD_MAX" -lt 1048576 ] && FD_MAX=1048576
+
     cat <<EOF > $CONF_FILE
 # ====================================================
-# VPS 终极调优配置 v5.0
+# VPS 终极调优配置 v5.1 (TCP/UDP 双协议优化)
 # ====================================================
 
-# [0] 系统级底座解封 (文件句柄与内存调度)
+# [0] 系统级底座解封
 fs.file-max = $FD_MAX
 vm.swappiness = 10
 vm.vfs_cache_pressure = 50
 
-# [1] 核心基础优化
+# [1] 核心基础优化 (BBR)
 net.ipv4.ip_forward = 1
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -98,13 +102,17 @@ net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_notsent_lowat = 16384
 
-# [2] 非对称 TCP 缓冲区
+# [2] 全局与 TCP 缓冲区 (非对称计算)
 net.core.rmem_max = $BUFFER_RX_MAX
 net.core.wmem_max = $BUFFER_TX_MAX
+# 提升默认缓冲区大小，对不具备自动调优的 UDP 极其重要
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
 net.ipv4.tcp_rmem = 4096 131072 $BUFFER_RX_MAX
 net.ipv4.tcp_wmem = 4096 131072 $BUFFER_TX_MAX
+net.ipv4.tcp_mem = $MEM_MIN $MEM_MID $MEM_MAX
 
-# [3] 高并发与资源回收 (加入 Keepalive 优化)
+# [3] 高并发与资源回收
 net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
@@ -120,9 +128,15 @@ net.netfilter.nf_conntrack_max = $CONN_MAX
 net.core.somaxconn = $Q_SIZE
 net.core.netdev_max_backlog = $Q_SIZE
 net.ipv4.tcp_max_syn_backlog = $Q_SIZE
+
+# [5] UDP 与 QUIC 专项优化 (为 Hysteria/TUIC 注入灵魂)
+# UDP 内存红线池 (与 TCP 独立计算，互不干扰)
+net.ipv4.udp_mem = $MEM_MIN $MEM_MID $MEM_MAX
+# 提高 UDP Socket 初始分配内存，防止大包瞬间丢弃
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
 EOF
 
-    # 2. 写入文件描述符 Limits 解封配置
     mkdir -p /etc/security/limits.d
     cat <<EOF > $LIMITS_FILE
 * soft nofile $FD_MAX
@@ -131,7 +145,6 @@ root soft nofile $FD_MAX
 root hard nofile $FD_MAX
 EOF
 
-    # 3. 生效配置
     sysctl --system >/dev/null 2>&1
     get_network_info
     mask=$(printf "%x" $(( (1 << CORES) - 1 )))
@@ -155,11 +168,9 @@ EOF
     systemctl daemon-reload
     systemctl enable vps-net-fix.service >/dev/null 2>&1
     systemctl restart vps-net-fix.service
-
-    # 立即应用 limits 到当前 shell 会话
     ulimit -n $FD_MAX 2>/dev/null
 
-    echo "${BOLD}${GREEN}✔ 全栈优化已完成！(网络/内存/并发封印均已解除)${NC}"
+    echo "${BOLD}${GREEN}✔ 全栈优化已完成！(TCP与UDP双协议封印均已解除)${NC}"
     pause
 }
 
@@ -231,7 +242,7 @@ while true; do
     get_network_info
     clear
     echo "${BOLD}${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${NC}"
-    echo "${BOLD}${CYAN}┃          VPS 智能全栈调优工具 v5.0 Final         ┃${NC}"
+    echo "${BOLD}${CYAN}┃          VPS 智能全栈调优工具 v5.1 Final         ┃${NC}"
     echo "${BOLD}${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}"
     
     bbr_status=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
@@ -244,19 +255,20 @@ while true; do
     if [[ -z "$bbr_status" ]]; then
         echo "  ${YELLOW}尚未执行调优，请选择选项 1 开始。${NC}"
     else
-        echo -e "  ${BOLD}网络底座${NC} : BBR已开启 | CWND=${PURPLE}${cwnd:-10}${NC} | FD上限=${GREEN}${fd_limit}${NC}"
-        echo -e "  ${BOLD}缓冲区大小${NC}: RX ${BLUE}$(( rmem / 1024 / 1024 ))MB${NC} | TX ${BLUE}$(( wmem / 1024 / 1024 ))MB${NC}"
+        echo -e "  ${BOLD}协议底座${NC} : BBR已开启 | CWND=${PURPLE}${cwnd:-10}${NC} | TCP+UDP双擎"
+        echo -e "  ${BOLD}高并发池${NC} : FD上限=${GREEN}${fd_limit}${NC} | Keepalive 快速回收"
+        echo -e "  ${BOLD}内核缓冲${NC} : RX ${BLUE}$(( rmem / 1024 / 1024 ))MB${NC} | TX ${BLUE}$(( wmem / 1024 / 1024 ))MB${NC}"
         
         if [[ -n "$tc_info" ]]; then
             rate=$(echo $tc_info | grep -Po '(?<=maxrate )(\S+)')
-            echo -e "  ${BOLD}TC 流量限速${NC}: ${GREEN}● 已开启 ($rate)${NC}"
+            echo -e "  ${BOLD}TC 限速 ${NC} : ${GREEN}● 已开启 ($rate)${NC}"
         else
-            echo -e "  ${BOLD}TC 流量限速${NC}: ${YELLOW}○ 未开启${NC}"
+            echo -e "  ${BOLD}TC 限速 ${NC} : ${YELLOW}○ 未开启${NC}"
         fi
     fi
     
     draw_line
-    echo -e "  ${BOLD}1)${NC} ${CYAN}执行全栈解封调优${NC} (网络/内存/百万并发)"
+    echo -e "  ${BOLD}1)${NC} ${CYAN}执行全栈网络调优${NC} (TCP/UDP解封+内存优化)"
     echo -e "  ${BOLD}2)${NC} ${YELLOW}管理 TC 上行限速${NC} (动态微调防断流)"
     echo -e "  ${BOLD}3)${NC} ${RED}彻底卸载并恢复默认${NC}"
     echo -e "  ${BOLD}0)${NC} 退出脚本"
