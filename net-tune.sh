@@ -35,17 +35,35 @@ pause() {
     read -n 1 -s -r -p "按任意键返回主菜单..."
 }
 
+# [优化版] 动态平滑计算单 Socket 缓冲区
 calc_buffer() {
     local bw=$1; local ram=$2; local factor=$3
+    
+    # 1. 计算理论目标缓冲区大小 (基于 BDP 冗余推算)
     local raw=$(( bw * factor * 131072 ))
-    [ "$raw" -lt 4194304 ] && raw=4194304
-    [ "$ram" -le 1024 ] && [ "$raw" -gt 33554432 ] && raw=33554432
-    [ "$ram" -le 4096 ] && [ "$raw" -gt 67108864 ] && raw=67108864
+
+    # 2. 动态计算当前物理内存的单 Socket 缓冲区红线 (物理内存的 2.5%)
+    local dynamic_max=$(( ram * 26214 ))
+
+    # 3. 设定硬性的绝对下限 (4MB) 和上限 (128MB)
+    local absolute_min=4194304
+    local absolute_max=134217728
+
+    # 4. 边界约束 (平滑钳制)
+    [ "$dynamic_max" -gt "$absolute_max" ] && dynamic_max=$absolute_max
+    [ "$dynamic_max" -lt "$absolute_min" ] && dynamic_max=$absolute_min
+
+    if [ "$raw" -gt "$dynamic_max" ]; then
+        raw=$dynamic_max
+    elif [ "$raw" -lt "$absolute_min" ]; then
+        raw=$absolute_min
+    fi
+
     echo "$raw"
 }
 
 # ====================================================
-# 模块 1: 底层网络核心调优 (v5.1 加入 UDP 专项)
+# 模块 1: 底层网络核心调优 (v5.2 加入 UDP 专项)
 # ====================================================
 setup_network() {
     clear
@@ -85,7 +103,7 @@ setup_network() {
 
     cat <<EOF > $CONF_FILE
 # ====================================================
-# VPS 终极调优配置 v5.1 (TCP/UDP 双协议优化)
+# VPS 终极调优配置 v5.2 (TCP/UDP 双协议优化)
 # ====================================================
 
 # [0] 系统级底座解封
@@ -108,21 +126,19 @@ net.core.wmem_max = $BUFFER_TX_MAX
 # 提升默认缓冲区大小，对不具备自动调优的 UDP 极其重要
 net.core.rmem_default = 1048576
 net.core.wmem_default = 1048576
+net.core.optmem_max = 65536
 net.ipv4.tcp_rmem = 4096 131072 $BUFFER_RX_MAX
 net.ipv4.tcp_wmem = 4096 131072 $BUFFER_TX_MAX
 net.ipv4.tcp_mem = $MEM_MIN $MEM_MID $MEM_MAX
 
 # [3] 高并发与资源回收
 net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_max_tw_buckets = 131072
 net.netfilter.nf_conntrack_tcp_timeout_established = 7200
 net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5
-net.nf_conntrack_max = $CONN_MAX
-net.netfilter.nf_conntrack_max = $CONN_MAX
 
 # [4] 队列与并发调优
 net.core.somaxconn = $Q_SIZE
@@ -204,14 +220,39 @@ manage_tc() {
             read -p "  请输入限速值 (单位 Mbps): " rate
             if [[ "$rate" =~ ^[0-9]+$ ]]; then
                 tc qdisc replace dev $MAIN_IFACE root fq maxrate ${rate}mbit 2>/dev/null
-                echo "${GREEN}✔ TC 限速已成功设置为 ${rate} Mbps！${NC}"
+                
+                # 写入独立的自启动服务实现持久化
+                cat <<EOF > /etc/systemd/system/vps-tc-limit.service
+[Unit]
+Description=VPS TC Rate Limit Persistence
+After=network-online.target vps-net-fix.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/tc qdisc replace dev $MAIN_IFACE root fq maxrate ${rate}mbit
+ExecStop=/sbin/tc qdisc del dev $MAIN_IFACE root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+                systemctl daemon-reload >/dev/null 2>&1
+                systemctl enable vps-tc-limit.service >/dev/null 2>&1
+                
+                echo "${GREEN}✔ TC 限速已成功设置为 ${rate} Mbps (已加入开机自启)！${NC}"
             else
                 echo "${RED}错误：请输入纯数字！${NC}"
             fi
             ;;
         2)
             tc qdisc del dev $MAIN_IFACE root 2>/dev/null
-            echo "${GREEN}✔ TC 限速已关闭，恢复无限制突发。${NC}"
+            
+            # 关闭并清理自启服务
+            systemctl disable vps-tc-limit.service >/dev/null 2>&1
+            rm -f /etc/systemd/system/vps-tc-limit.service
+            systemctl daemon-reload >/dev/null 2>&1
+            
+            echo "${GREEN}✔ TC 限速已关闭，恢复无限制突发，并已移除开机自启。${NC}"
             ;;
         0) return 0 ;;
         *) echo "${RED}无效选项！${NC}" ;;
@@ -225,8 +266,8 @@ manage_tc() {
 uninstall_all() {
     get_network_info
     echo -e "\n${YELLOW}正在清理所有优化配置...${NC}"
-    rm -f $CONF_FILE $SERVICE_FILE $LIMITS_FILE
-    systemctl disable vps-net-fix.service >/dev/null 2>&1
+    rm -f $CONF_FILE $SERVICE_FILE $LIMITS_FILE /etc/systemd/system/vps-tc-limit.service
+    systemctl disable vps-net-fix.service vps-tc-limit.service >/dev/null 2>&1
     systemctl daemon-reload
     tc qdisc del dev $MAIN_IFACE root 2>/dev/null
     ip route change default via $GATEWAY dev $MAIN_IFACE initcwnd 10 initrwnd 10
@@ -242,7 +283,7 @@ while true; do
     get_network_info
     clear
     echo "${BOLD}${CYAN}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${NC}"
-    echo "${BOLD}${CYAN}┃          VPS 智能全栈调优工具 v5.1 Final         ┃${NC}"
+    echo "${BOLD}${CYAN}┃          VPS 智能全栈调优工具 v5.2 Final         ┃${NC}"
     echo "${BOLD}${CYAN}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}"
     
     bbr_status=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
@@ -268,7 +309,7 @@ while true; do
     fi
     
     draw_line
-    echo -e "  ${BOLD}1)${NC} ${CYAN}执行全栈网络调优${NC} (TCP/UDP解封+内存优化)"
+    echo -e "  ${BOLD}1)${NC} ${CYAN}执行全栈网络调优${NC} (TCP/UDP解封+动态内存优化)"
     echo -e "  ${BOLD}2)${NC} ${YELLOW}管理 TC 上行限速${NC} (动态微调防断流)"
     echo -e "  ${BOLD}3)${NC} ${RED}彻底卸载并恢复默认${NC}"
     echo -e "  ${BOLD}0)${NC} 退出脚本"
