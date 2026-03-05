@@ -35,21 +35,22 @@ pause() {
     read -n 1 -s -r -p "按任意键返回主菜单..."
 }
 
-# [优化版] 动态平滑计算单 Socket 缓冲区
+# 计算单 Socket 缓冲区
 calc_buffer() {
     local bw=$1; local ram=$2; local factor=$3
     
-    # 1. 计算理论目标缓冲区大小 (基于 BDP 冗余推算)
-    local raw=$(( bw * factor * 131072 ))
+    # 1. 科学计算 BDP (Factor=4 代表 0.4s 的两倍高延迟冗余)
+    local raw=$(( bw * 131072 * factor / 10 ))
 
-    # 2. 动态计算当前物理内存的单 Socket 缓冲区红线 (物理内存的 2.5%)
+    # 2. 动态内存红线：放宽至物理内存的 2.5% (兼顾安全与万兆吞吐)
+    # 公式推导: RAM * 1024 * 1024 * 0.025 ≈ RAM * 26214
     local dynamic_max=$(( ram * 26214 ))
 
-    # 3. 设定硬性的绝对下限 (4MB) 和上限 (128MB)
-    local absolute_min=4194304
-    local absolute_max=134217728
+    # 3. 释放天花板，兼容 10G 极限网络
+    local absolute_min=4194304     # 4MB 保底 (应对普通宽带)
+    local absolute_max=536870912   # 512MB 封顶 (解锁 10Gbps 带宽)
 
-    # 4. 边界约束 (平滑钳制)
+    # 4. 智能钳制
     [ "$dynamic_max" -gt "$absolute_max" ] && dynamic_max=$absolute_max
     [ "$dynamic_max" -lt "$absolute_min" ] && dynamic_max=$absolute_min
 
