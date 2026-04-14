@@ -136,7 +136,6 @@ net.ipv4.tcp_mem = $MEM_MIN $MEM_MID $MEM_MAX
 net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_max_tw_buckets = 131072
-net.netfilter.nf_conntrack_tcp_timeout_established = 7200
 net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5
