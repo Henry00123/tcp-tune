@@ -129,7 +129,7 @@ net.core.rmem_default = 1048576
 net.core.wmem_default = 1048576
 net.core.optmem_max = 65536
 net.ipv4.tcp_rmem = 4096 131072 $BUFFER_RX_MAX
-net.ipv4.tcp_wmem = 4096 131072 $BUFFER_TX_MAX
+net.ipv4.tcp_wmem = 4096 65536 $BUFFER_TX_MAX
 net.ipv4.tcp_mem = $MEM_MIN $MEM_MID $MEM_MAX
 
 # [3] 高并发与资源回收
