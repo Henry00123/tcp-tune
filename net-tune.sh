@@ -35,22 +35,16 @@ pause() {
     read -n 1 -s -r -p "按任意键返回主菜单..."
 }
 
-# 计算单 Socket 缓冲区
+# 计算单 Socket 缓冲区（精确对齐 2MB 边界）
 calc_buffer() {
     local bw=$1; local ram=$2; local factor=$3
+    local block=$(( 2 * 1024 * 1024 ))  # 2MB 字节基准单位
     
-    # 1. 科学计算 BDP (Factor=4 代表 0.4s 的两倍高延迟冗余)
     local raw=$(( bw * 131072 * factor / 10 ))
-
-    # 2. 动态内存红线：放宽至物理内存的 2.5% (兼顾安全与万兆吞吐)
-    # 公式推导: RAM * 1024 * 1024 * 0.025 ≈ RAM * 26214
     local dynamic_max=$(( ram * 26214 ))
+    local absolute_min=4194304     # 4MB 保底
+    local absolute_max=536870912   # 512MB 封顶
 
-    # 3. 释放天花板，兼容 10G 极限网络
-    local absolute_min=4194304     # 4MB 保底 (应对普通宽带)
-    local absolute_max=536870912   # 512MB 封顶 (解锁 10Gbps 带宽)
-
-    # 4. 智能钳制
     [ "$dynamic_max" -gt "$absolute_max" ] && dynamic_max=$absolute_max
     [ "$dynamic_max" -lt "$absolute_min" ] && dynamic_max=$absolute_min
 
@@ -60,27 +54,35 @@ calc_buffer() {
         raw=$absolute_min
     fi
 
+    # 2MB 边界对齐
+    raw=$(( (raw + block / 2) / block * block ))
+    [ "$raw" -gt "$absolute_max" ] && raw=$absolute_max
+    [ "$raw" -lt "$absolute_min" ] && raw=$absolute_min
+
     echo "$raw"
 }
 
 # ====================================================
-# 模块 1: 底层网络核心调优 (v5.2 加入 UDP 专项)
+# 模块 1: 底层网络核心调优 (已实现硬件自动获取)
 # ====================================================
 setup_network() {
     clear
     echo "${BOLD}${PURPLE}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${NC}"
-    echo "${BOLD}${PURPLE}┃          全栈系统与网络调优 (底层解封)           ┃${NC}"
+    echo "${BOLD}${PURPLE}┃           全栈系统与网络调优 (底层解封)          ┃${NC}"
     echo "${BOLD}${PURPLE}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}"
     
-    echo "${BOLD}${CYAN}➔ 1. 硬件配置${NC}"
-    read -p "   请输入 CPU 核心数: " CORES
-    read -p "   请输入物理内存 (MB): " RAM_MB
-
-    echo "${BOLD}${CYAN}➔ 2. 网络带宽${NC}"
+    # 自动获取硬件基础设施信息
+    CORES=$(nproc)
+    RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
+    
+    echo -e "系统硬件检测: CPU核心数 = ${CYAN}$CORES${NC} | 物理内存 = ${CYAN}${RAM_MB}MB${NC}"
+    draw_line
+    
+    echo "${BOLD}${CYAN}➔ 1. 网络带宽${NC}"
     read -p "   请输入下行带宽 (Mbps): " DL_MBPS
     read -p "   请输入上行带宽 (Mbps): " UL_MBPS
 
-    echo "${BOLD}${CYAN}➔ 3. 线路类型${NC}"
+    echo -e "\n${BOLD}${CYAN}➔ 2. 线路类型${NC}"
     echo "   1) 美欧/长距离 (RTT > 150ms)"
     echo "   2) 亚太/短距离 (RTT < 60ms)"
     read -p "   请选择 [1-2]: " REG_CHOICE
@@ -90,10 +92,62 @@ setup_network() {
 
     BUFFER_RX_MAX=$(calc_buffer $DL_MBPS $RAM_MB $RTT_FACTOR)
     BUFFER_TX_MAX=$(calc_buffer $UL_MBPS $RAM_MB $RTT_FACTOR)
+    
+    apply_sysctl_config "$CORES" "$RAM_MB" "$BUFFER_RX_MAX" "$BUFFER_TX_MAX"
+}
+
+# ====================================================
+# 模块 2: 手动指定缓冲区大小 (2MB倍数自动对齐)
+# ====================================================
+manual_buffer() {
+    clear
+    echo "${BOLD}${PURPLE}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${NC}"
+    echo "${BOLD}${PURPLE}┃           手动定制内核缓冲区 (2MB倍数对齐)          ┃${NC}"
+    echo "${BOLD}${PURPLE}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}"
+    
+    # 自动获取硬件基础设施信息
+    CORES=$(nproc)
+    RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
+    
+    echo -e "系统硬件检测: CPU核心数 = ${CYAN}$CORES${NC} | 物理内存 = ${CYAN}${RAM_MB}MB${NC}"
+    draw_line
+    
+    echo "${BOLD}${CYAN}➔ 请输入自定义参数 (有效范围: 4MB - 512MB)${NC}"
+    read -p "   请输入接收缓冲区大小 RX Buffer (MB): " rx_mb
+    read -p "   请输入发送缓冲区大小 TX Buffer (MB): " tx_mb
+    
+    if [[ ! "$rx_mb" =~ ^[0-9]+$ ]] || [[ ! "$tx_mb" =~ ^[0-9]+$ ]]; then
+        echo "${RED}错误：请输入纯正整数数字！${NC}"
+        pause
+        return 1
+    fi
+    
+    # 2MB 边界对齐逻辑：奇数自动向上加 1 变成偶数
+    [[ $((rx_mb % 2)) -ne 0 ]] && rx_mb=$((rx_mb + 1))
+    [[ $((tx_mb % 2)) -ne 0 ]] && tx_mb=$((tx_mb + 1))
+    
+    # 极端值防御钳制
+    [[ $rx_mb -lt 4 ]] && rx_mb=4 && echo "${YELLOW}⚠ RX过小，已触发4MB保底机制${NC}"
+    [[ $rx_mb -gt 512 ]] && rx_mb=512 && echo "${YELLOW}⚠ RX过大，已触发512MB封顶机制${NC}"
+    [[ $tx_mb -lt 4 ]] && tx_mb=4 && echo "${YELLOW}⚠ TX过小，已触发4MB保底机制${NC}"
+    [[ $tx_mb -gt 512 ]] && tx_mb=512 && echo "${YELLOW}⚠ TX过大，已触发512MB封顶机制${NC}"
+    
+    BUFFER_RX_MAX=$(( rx_mb * 1024 * 1024 ))
+    BUFFER_TX_MAX=$(( tx_mb * 1024 * 1024 ))
+    
+    echo -e "\n${YELLOW}正在精准应用手动配置 (RX: ${rx_mb}MB | TX: ${tx_mb}MB)...${NC}"
+    apply_sysctl_config "$CORES" "$RAM_MB" "$BUFFER_RX_MAX" "$BUFFER_TX_MAX"
+}
+
+# ====================================================
+# 公共配置应用底层引擎
+# ====================================================
+apply_sysctl_config() {
+    local CORES=$1; local RAM_MB=$2; local BUFFER_RX_MAX=$3; local BUFFER_TX_MAX=$4
+
     CONN_MAX=$(( RAM_MB * 100 )); [ "$CONN_MAX" -lt 65536 ] && CONN_MAX=65536
     Q_SIZE=$(( CORES * 8192 )); [ "$Q_SIZE" -gt 65535 ] && Q_SIZE=65535
     
-    # TCP与UDP的共享内存红线 (25%物理内存)
     PAGES_PER_MB=256
     MEM_MAX=$(( RAM_MB * PAGES_PER_MB * 25 / 100 ))
     MEM_MID=$(( MEM_MAX * 3 / 4 ))
@@ -124,7 +178,6 @@ net.ipv4.tcp_notsent_lowat = 16384
 # [2] 全局与 TCP 缓冲区 (非对称计算)
 net.core.rmem_max = $BUFFER_RX_MAX
 net.core.wmem_max = $BUFFER_TX_MAX
-# 提升默认缓冲区大小，对不具备自动调优的 UDP 极其重要
 net.core.rmem_default = 1048576
 net.core.wmem_default = 1048576
 net.core.optmem_max = 65536
@@ -145,10 +198,8 @@ net.core.somaxconn = $Q_SIZE
 net.core.netdev_max_backlog = $Q_SIZE
 net.ipv4.tcp_max_syn_backlog = $Q_SIZE
 
-# [5] UDP 与 QUIC 专项优化 (为 Hysteria/TUIC 注入灵魂)
-# UDP 内存红线池 (与 TCP 独立计算，互不干扰)
+# [5] UDP 与 QUIC 专项优化
 net.ipv4.udp_mem = $MEM_MIN $MEM_MID $MEM_MAX
-# 提高 UDP Socket 初始分配内存，防止大包瞬间丢弃
 net.ipv4.udp_rmem_min = 16384
 net.ipv4.udp_wmem_min = 16384
 EOF
@@ -186,18 +237,18 @@ EOF
     systemctl restart vps-net-fix.service
     ulimit -n $FD_MAX 2>/dev/null
 
-    echo "${BOLD}${GREEN}✔ 全栈优化已完成！(TCP与UDP双协议封印均已解除)${NC}"
+    echo "${BOLD}${GREEN}✔ 优化配置已成功应用！(内核底座已刷新)${NC}"
     pause
 }
 
 # ====================================================
-# 模块 2: TC 流量整形单独管理
+# 模块 3: TC 流量整形单独管理
 # ====================================================
 manage_tc() {
     get_network_info
     clear
     echo "${BOLD}${YELLOW}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${NC}"
-    echo "${BOLD}${YELLOW}┃              TC 上行流量限速控制台               ┃${NC}"
+    echo "${BOLD}${YELLOW}┃               TC 上行流量限速控制台              ┃${NC}"
     echo "${BOLD}${YELLOW}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}"
     
     tc_info=$(tc qdisc show dev $MAIN_IFACE 2>/dev/null | grep "maxrate")
@@ -221,7 +272,6 @@ manage_tc() {
             if [[ "$rate" =~ ^[0-9]+$ ]]; then
                 tc qdisc replace dev $MAIN_IFACE root fq maxrate ${rate}mbit 2>/dev/null
                 
-                # 写入独立的自启动服务实现持久化
                 cat <<EOF > /etc/systemd/system/vps-tc-limit.service
 [Unit]
 Description=VPS TC Rate Limit Persistence
@@ -238,21 +288,17 @@ WantedBy=multi-user.target
 EOF
                 systemctl daemon-reload >/dev/null 2>&1
                 systemctl enable vps-tc-limit.service >/dev/null 2>&1
-                
-                echo "${GREEN}✔ TC 限速已成功设置为 ${rate} Mbps (已加入开机自启)！${NC}"
+                echo "${GREEN}✔ TC 限速已成功设置为 ${rate} Mbps！${NC}"
             else
                 echo "${RED}错误：请输入纯数字！${NC}"
             fi
             ;;
         2)
             tc qdisc del dev $MAIN_IFACE root 2>/dev/null
-            
-            # 关闭并清理自启服务
             systemctl disable vps-tc-limit.service >/dev/null 2>&1
             rm -f /etc/systemd/system/vps-tc-limit.service
             systemctl daemon-reload >/dev/null 2>&1
-            
-            echo "${GREEN}✔ TC 限速已关闭，恢复无限制突发，并已移除开机自启。${NC}"
+            echo "${GREEN}✔ TC 限速已关闭，恢复无限制突发。${NC}"
             ;;
         0) return 0 ;;
         *) echo "${RED}无效选项！${NC}" ;;
@@ -261,7 +307,7 @@ EOF
 }
 
 # ====================================================
-# 模块 3: 彻底卸载
+# 模块 4: 彻底卸载
 # ====================================================
 uninstall_all() {
     get_network_info
@@ -294,7 +340,7 @@ while true; do
     fd_limit=$(ulimit -n 2>/dev/null)
     
     if [[ -z "$bbr_status" ]]; then
-        echo "  ${YELLOW}尚未执行调优，请选择选项 1 开始。${NC}"
+        echo "  ${YELLOW}尚未执行调优，请选择选项 1 或 2 开始。${NC}"
     else
         echo -e "  ${BOLD}协议底座${NC} : BBR已开启 | CWND=${PURPLE}${cwnd:-10}${NC} | TCP+UDP双擎"
         echo -e "  ${BOLD}高并发池${NC} : FD上限=${GREEN}${fd_limit}${NC} | Keepalive 快速回收"
@@ -309,17 +355,19 @@ while true; do
     fi
     
     draw_line
-    echo -e "  ${BOLD}1)${NC} ${CYAN}执行全栈网络调优${NC} (TCP/UDP解封+动态内存优化)"
-    echo -e "  ${BOLD}2)${NC} ${YELLOW}管理 TC 上行限速${NC} (动态微调防断流)"
-    echo -e "  ${BOLD}3)${NC} ${RED}彻底卸载并恢复默认${NC}"
+    echo -e "  ${BOLD}1)${NC} ${CYAN}执行全栈网络调优${NC} (硬件全自动侦测 + 动态算法)"
+    echo -e "  ${BOLD}2)${NC} ${PURPLE}手动定制内核缓冲区${NC} (手动指定MB大小, 2MB对齐)"
+    echo -e "  ${BOLD}3)${NC} ${YELLOW}管理 TC 上行限速${NC} (动态微调防断流)"
+    echo -e "  ${BOLD}4)${NC} ${RED}彻底卸载并恢复默认${NC}"
     echo -e "  ${BOLD}0)${NC} 退出脚本"
     draw_line
     
-    read -p "  请选择操作 [0-3]: " main_choice
+    read -p "  请选择操作 [0-4]: " main_choice
     case $main_choice in
         1) setup_network ;;
-        2) manage_tc ;;
-        3) uninstall_all ;;
+        2) manual_buffer ;;
+        3) manage_tc ;;
+        4) uninstall_all ;;
         0) clear; exit 0 ;;
         *) echo "${RED}无效的选项，请重新输入！${NC}"; sleep 1 ;;
     esac
