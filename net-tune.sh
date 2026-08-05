@@ -20,6 +20,7 @@ NC=$'\e[0m'
 CONF_FILE="/etc/sysctl.d/99-vps-tune.conf"
 SERVICE_FILE="/etc/systemd/system/vps-net-fix.service"
 LIMITS_FILE="/etc/security/limits.d/99-vps-limits.conf"
+TC_SERVICE_FILE="/etc/systemd/system/vps-tc-limit.service"
 
 get_network_info() {
     MAIN_IFACE=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
@@ -42,8 +43,8 @@ calc_buffer() {
     
     local raw=$(( bw * 131072 * factor / 10 ))
     local dynamic_max=$(( ram * 26214 ))
-    local absolute_min=4194304     # 4MB 保底
-    local absolute_max=536870912   # 512MB 封顶
+    local absolute_min=4194304       # 4MB 保底
+    local absolute_max=536870912     # 512MB 封顶
 
     [ "$dynamic_max" -gt "$absolute_max" ] && dynamic_max=$absolute_max
     [ "$dynamic_max" -lt "$absolute_min" ] && dynamic_max=$absolute_min
@@ -68,7 +69,7 @@ calc_buffer() {
 setup_network() {
     clear
     echo "${BOLD}${PURPLE}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${NC}"
-    echo "${BOLD}${PURPLE}┃           全栈系统与网络调优 (底层解封)          ┃${NC}"
+    echo "${BOLD}${PURPLE}┃            全栈系统与网络调优 (底层解封)         ┃${NC}"
     echo "${BOLD}${PURPLE}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}"
     
     # 自动获取硬件基础设施信息
@@ -102,7 +103,7 @@ setup_network() {
 manual_buffer() {
     clear
     echo "${BOLD}${PURPLE}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${NC}"
-    echo "${BOLD}${PURPLE}┃           手动定制内核缓冲区 (2MB倍数对齐)          ┃${NC}"
+    echo "${BOLD}${PURPLE}┃            手动定制内核缓冲区 (2MB倍数对齐)         ┃${NC}"
     echo "${BOLD}${PURPLE}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}"
     
     # 自动获取硬件基础设施信息
@@ -242,37 +243,85 @@ EOF
 }
 
 # ====================================================
-# 模块 3: TC 流量整形单独管理
+# 模块 3: TC 流量整形单独管理 (支持双向分别限速)
 # ====================================================
 manage_tc() {
     get_network_info
     clear
     echo "${BOLD}${YELLOW}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓${NC}"
-    echo "${BOLD}${YELLOW}┃               TC 上行流量限速控制台              ┃${NC}"
+    echo "${BOLD}${YELLOW}┃            TC 上下行流量限速控制台               ┃${NC}"
     echo "${BOLD}${YELLOW}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}"
     
-    tc_info=$(tc qdisc show dev $MAIN_IFACE 2>/dev/null | grep "maxrate")
-    if [[ -n "$tc_info" ]]; then
-        current_rate=$(echo $tc_info | grep -Po '(?<=maxrate )(\S+)')
-        echo -e "当前状态: ${GREEN}● 已开启 ($current_rate)${NC}"
+    # 侦测上行状态
+    ul_info=$(tc qdisc show dev $MAIN_IFACE 2>/dev/null | grep "maxrate")
+    if [[ -n "$ul_info" ]]; then
+        ul_rate=$(echo "$ul_info" | grep -Po '(?<=maxrate )(\S+)')
+        echo -e "当前上行状态: ${GREEN}● 已开启 ($ul_rate)${NC}"
     else
-        echo -e "当前状态: ${YELLOW}○ 未开启${NC}"
+        echo -e "当前上行状态: ${YELLOW}○ 未开启 (无限制)${NC}"
+    fi
+
+    # 侦测下行状态 (基于 ifb0 虚拟网卡)
+    dl_info=$(tc qdisc show dev ifb0 2>/dev/null | grep "maxrate")
+    if [[ -n "$dl_info" ]]; then
+        dl_rate=$(echo "$dl_info" | grep -Po '(?<=maxrate )(\S+)')
+        echo -e "当前下行状态: ${GREEN}● 已开启 ($dl_rate)${NC}"
+    else
+        echo -e "当前下行状态: ${YELLOW}○ 未开启 (无限制)${NC}"
     fi
     draw_line
     
     echo "  ${BOLD}1)${NC} ${GREEN}开启 / 修改限速${NC}"
-    echo "  ${BOLD}2)${NC} ${RED}关闭限速${NC}"
+    echo "  ${BOLD}2)${NC} ${RED}关闭全部限速${NC}"
     echo "  ${BOLD}0)${NC} 返回主菜单"
     draw_line
     
     read -p "  请选择操作 [0-2]: " tc_choice
     case $tc_choice in
         1)
-            read -p "  请输入限速值 (单位 Mbps): " rate
-            if [[ "$rate" =~ ^[0-9]+$ ]]; then
-                tc qdisc replace dev $MAIN_IFACE root fq maxrate ${rate}mbit 2>/dev/null
-                
-                cat <<EOF > /etc/systemd/system/vps-tc-limit.service
+            read -p "  请输入【上行】限速值 (单位 Mbps，0表示不限): " up_rate
+            read -p "  请输入【下行】限速值 (单位 Mbps，0表示不限): " down_rate
+            
+            if [[ "$up_rate" =~ ^[0-9]+$ ]] && [[ "$down_rate" =~ ^[0-9]+$ ]]; then
+                if [[ "$up_rate" -eq 0 ]] && [[ "$down_rate" -eq 0 ]]; then
+                    # 均为 0，等同于彻底卸载限速
+                    tc qdisc del dev $MAIN_IFACE root 2>/dev/null
+                    tc qdisc del dev $MAIN_IFACE ingress 2>/dev/null
+                    tc qdisc del dev ifb0 root 2>/dev/null
+                    systemctl disable vps-tc-limit.service >/dev/null 2>&1
+                    rm -f $TC_SERVICE_FILE
+                    systemctl daemon-reload >/dev/null 2>&1
+                    echo "${GREEN}✔ 检测到双向均为 0，已清除所有限速规则，恢复无限制突发。${NC}"
+                else
+                    # 动态生成启动命令脚本内容
+                    EXEC_START_CMD=""
+                    
+                    # 1. 临时应用并记录【上行】限速
+                    if [[ "$up_rate" -gt 0 ]]; then
+                        tc qdisc replace dev $MAIN_IFACE root fq maxrate ${up_rate}mbit 2>/dev/null
+                        EXEC_START_CMD="${EXEC_START_CMD}/sbin/tc qdisc replace dev $MAIN_IFACE root fq maxrate ${up_rate}mbit; "
+                    else
+                        tc qdisc del dev $MAIN_IFACE root 2>/dev/null
+                    fi
+                    
+                    # 2. 临时应用并记录【下行】限速 (重定向 ingress 至 ifb0)
+                    if [[ "$down_rate" -gt 0 ]]; then
+                        modprobe ifb numifbs=1 2>/dev/null
+                        ip link set dev ifb0 up 2>/dev/null
+                        tc qdisc add dev $MAIN_IFACE handle ffff: ingress 2>/dev/null || true
+                        tc filter replace dev $MAIN_IFACE parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0 2>/dev/null
+                        tc qdisc replace dev ifb0 root fq maxrate ${down_rate}mbit 2>/dev/null
+                        
+                        EXEC_START_CMD="${EXEC_START_CMD}/sbin/modprobe ifb numifbs=1; /sbin/ip link set dev ifb0 up; /sbin/tc qdisc add dev $MAIN_IFACE handle ffff: ingress 2>/dev/null || true; /sbin/tc filter replace dev $MAIN_IFACE parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0; /sbin/tc qdisc replace dev ifb0 root fq maxrate ${down_rate}mbit; "
+                    else
+                        tc qdisc del dev $MAIN_IFACE ingress 2>/dev/null
+                        tc qdisc del dev ifb0 root 2>/dev/null
+                    fi
+                    
+                    EXEC_START_CMD="${EXEC_START_CMD}true"
+
+                    # 3. 写入系统级持久化守护
+                    cat <<EOF > $TC_SERVICE_FILE
 [Unit]
 Description=VPS TC Rate Limit Persistence
 After=network-online.target vps-net-fix.service
@@ -280,25 +329,29 @@ After=network-online.target vps-net-fix.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/sbin/tc qdisc replace dev $MAIN_IFACE root fq maxrate ${rate}mbit
-ExecStop=/sbin/tc qdisc del dev $MAIN_IFACE root
+ExecStart=/bin/bash -c '$EXEC_START_CMD'
+ExecStop=/bin/bash -c '/sbin/tc qdisc del dev $MAIN_IFACE root 2>/dev/null; /sbin/tc qdisc del dev $MAIN_IFACE ingress 2>/dev/null; /sbin/tc qdisc del dev ifb0 root 2>/dev/null; true'
 
 [Install]
 WantedBy=multi-user.target
 EOF
-                systemctl daemon-reload >/dev/null 2>&1
-                systemctl enable vps-tc-limit.service >/dev/null 2>&1
-                echo "${GREEN}✔ TC 限速已成功设置为 ${rate} Mbps！${NC}"
+                    systemctl daemon-reload >/dev/null 2>&1
+                    systemctl enable vps-tc-limit.service >/dev/null 2>&1
+                    
+                    echo "${GREEN}✔ TC 限速已成功设置！(上行: ${up_rate}Mbps | 下行: ${down_rate}Mbps)${NC}"
+                fi
             else
-                echo "${RED}错误：请输入纯数字！${NC}"
+                echo "${RED}错误：请输入纯正整数！${NC}"
             fi
             ;;
         2)
             tc qdisc del dev $MAIN_IFACE root 2>/dev/null
+            tc qdisc del dev $MAIN_IFACE ingress 2>/dev/null
+            tc qdisc del dev ifb0 root 2>/dev/null
             systemctl disable vps-tc-limit.service >/dev/null 2>&1
-            rm -f /etc/systemd/system/vps-tc-limit.service
+            rm -f $TC_SERVICE_FILE
             systemctl daemon-reload >/dev/null 2>&1
-            echo "${GREEN}✔ TC 限速已关闭，恢复无限制突发。${NC}"
+            echo "${GREEN}✔ TC 全部限速已关闭，恢复无限制突发。${NC}"
             ;;
         0) return 0 ;;
         *) echo "${RED}无效选项！${NC}" ;;
@@ -312,10 +365,18 @@ EOF
 uninstall_all() {
     get_network_info
     echo -e "\n${YELLOW}正在清理所有优化配置...${NC}"
-    rm -f $CONF_FILE $SERVICE_FILE $LIMITS_FILE /etc/systemd/system/vps-tc-limit.service
+    
+    # 清理文件
+    rm -f $CONF_FILE $SERVICE_FILE $LIMITS_FILE $TC_SERVICE_FILE
     systemctl disable vps-net-fix.service vps-tc-limit.service >/dev/null 2>&1
     systemctl daemon-reload
+    
+    # 卸载所有 tc 队列规则
     tc qdisc del dev $MAIN_IFACE root 2>/dev/null
+    tc qdisc del dev $MAIN_IFACE ingress 2>/dev/null 
+    tc qdisc del dev ifb0 root 2>/dev/null
+    ip link set dev ifb0 down 2>/dev/null
+
     ip route change default via $GATEWAY dev $MAIN_IFACE initcwnd 10 initrwnd 10
     sysctl --system >/dev/null 2>&1
     echo "${GREEN}✔ 卸载成功，系统已彻底恢复原貌。${NC}"
@@ -336,8 +397,11 @@ while true; do
     rmem=$(sysctl net.core.rmem_max 2>/dev/null | awk '{print $3}')
     wmem=$(sysctl net.core.wmem_max 2>/dev/null | awk '{print $3}')
     cwnd=$(ip route show | grep default | grep -Po '(?<=initcwnd )\d+')
-    tc_info=$(tc qdisc show dev $MAIN_IFACE 2>/dev/null | grep "maxrate")
     fd_limit=$(ulimit -n 2>/dev/null)
+    
+    # 获取 TC 状态 (上行和下行)
+    ul_info=$(tc qdisc show dev $MAIN_IFACE 2>/dev/null | grep "maxrate")
+    dl_info=$(tc qdisc show dev ifb0 2>/dev/null | grep "maxrate")
     
     if [[ -z "$bbr_status" ]]; then
         echo "  ${YELLOW}尚未执行调优，请选择选项 1 或 2 开始。${NC}"
@@ -346,9 +410,11 @@ while true; do
         echo -e "  ${BOLD}高并发池${NC} : FD上限=${GREEN}${fd_limit}${NC} | Keepalive 快速回收"
         echo -e "  ${BOLD}内核缓冲${NC} : RX ${BLUE}$(( rmem / 1024 / 1024 ))MB${NC} | TX ${BLUE}$(( wmem / 1024 / 1024 ))MB${NC}"
         
-        if [[ -n "$tc_info" ]]; then
-            rate=$(echo $tc_info | grep -Po '(?<=maxrate )(\S+)')
-            echo -e "  ${BOLD}TC 限速 ${NC} : ${GREEN}● 已开启 ($rate)${NC}"
+        # 面板显示 TC 上下行状态
+        if [[ -n "$ul_info" ]] || [[ -n "$dl_info" ]]; then
+            ul_rate=$(echo "$ul_info" | grep -Po '(?<=maxrate )(\S+)' || echo "无限制")
+            dl_rate=$(echo "$dl_info" | grep -Po '(?<=maxrate )(\S+)' || echo "无限制")
+            echo -e "  ${BOLD}TC 限速 ${NC} : ${GREEN}● 已开启 (上行: $ul_rate | 下行: $dl_rate)${NC}"
         else
             echo -e "  ${BOLD}TC 限速 ${NC} : ${YELLOW}○ 未开启${NC}"
         fi
@@ -357,7 +423,7 @@ while true; do
     draw_line
     echo -e "  ${BOLD}1)${NC} ${CYAN}执行全栈网络调优${NC} (硬件全自动侦测 + 动态算法)"
     echo -e "  ${BOLD}2)${NC} ${PURPLE}手动定制内核缓冲区${NC} (手动指定MB大小, 2MB对齐)"
-    echo -e "  ${BOLD}3)${NC} ${YELLOW}管理 TC 上行限速${NC} (动态微调防断流)"
+    echo -e "  ${BOLD}3)${NC} ${YELLOW}管理 TC 流量限速${NC} (双向独立控制, 防断流)"
     echo -e "  ${BOLD}4)${NC} ${RED}彻底卸载并恢复默认${NC}"
     echo -e "  ${BOLD}0)${NC} 退出脚本"
     draw_line
