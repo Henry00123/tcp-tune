@@ -171,9 +171,6 @@ vm.vfs_cache_pressure = 50
 net.ipv4.ip_forward = 1
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_notsent_lowat = 16384
 
 # [2] 全局与 TCP 缓冲区 (非对称计算)
