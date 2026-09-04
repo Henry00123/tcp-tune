@@ -31,6 +31,7 @@ SYSCTL_KEYS=(
     net.ipv4.ip_local_port_range net.ipv4.tcp_fin_timeout net.ipv4.tcp_tw_reuse
     net.ipv4.tcp_max_tw_buckets net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_mtu_probing
     net.ipv4.tcp_keepalive_time net.ipv4.tcp_keepalive_intvl net.ipv4.tcp_keepalive_probes
+    net.ipv4.tcp_fastopen
     net.core.somaxconn net.core.netdev_max_backlog net.ipv4.tcp_max_syn_backlog
     net.ipv4.udp_rmem_min net.ipv4.udp_wmem_min
 )
@@ -220,6 +221,7 @@ net.ipv4.tcp_rmem = 4096 131072 $BUFFER_RX_MAX
 net.ipv4.tcp_wmem = 4096 65536 $BUFFER_TX_MAX
 
 # [3] 连接与资源回收
+net.ipv4.tcp_fastopen=3
 net.ipv4.ip_local_port_range = 10240 65535
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_tw_reuse = 1
